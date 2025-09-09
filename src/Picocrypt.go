@@ -14,6 +14,7 @@ https://github.com/Picocrypt/Picocrypt
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
@@ -111,6 +112,9 @@ var commentsDisabled bool
 
 // Advanced options
 var paranoid bool
+var aesMode bool                    // AES-256-CTR mode (alternative to ChaCha20)
+var cipherSelected int32            // 0 = ChaCha20, 1 = AES-256, 2 = Paranoid
+var cipherModes = []string{"ChaCha20", "AES-256", "Paranoid"}
 var reedsolo bool
 var deniability bool
 var recursively bool
@@ -651,9 +655,22 @@ func draw() {
 			giu.Label("Advanced:"),
 			giu.Custom(func() {
 				if mode != "decrypt" {
+					// Cipher mode selection: ChaCha20 (default), AES-256, Paranoid (ChaCha20+Serpent)
 					giu.Row(
-						giu.Checkbox("Paranoid mode", &paranoid),
-						giu.Tooltip("Provides the highest level of security attainable"),
+						giu.Combo("Cipher", cipherModes[cipherSelected], cipherModes, &cipherSelected).Size(116).OnChange(func() {
+							// Sync boolean flags for legacy logic
+							if cipherSelected == 2 {
+								paranoid = true
+								aesMode = false
+							} else if cipherSelected == 1 {
+								paranoid = false
+								aesMode = true
+							} else {
+								paranoid = false
+								aesMode = false
+							}
+						}),
+						giu.Tooltip("Choose encryption primitive: ChaCha20 (fast), AES-256-CTR (compatible), or Paranoid (ChaCha20 + Serpent + stronger KDF)"),
 						giu.Dummy(-170, 0),
 						giu.Style().SetDisabled(recursively || !(len(allFiles) > 1 || len(onlyFolders) > 0)).To(
 							giu.Checkbox("Compress files", &compress),
@@ -1617,10 +1634,12 @@ func work() {
 			}
 		}
 
-		// Configure flags and write to file
+		// Configure flags and write to file (flags[0]: 0=Normal,1=Paranoid,2=AES)
 		flags := make([]byte, 5)
-		if paranoid { // Paranoid mode selected
+		if paranoid {
 			flags[0] = 1
+		} else if aesMode {
+			flags[0] = 2
 		}
 		if len(keyfiles) > 0 { // Keyfiles are being used
 			flags[1] = 1
@@ -1711,8 +1730,10 @@ func work() {
 		fin.Read(flags)
 		flags, errs[2] = rsDecode(rs5, flags)
 		paranoid = flags[0] == 1
+		aesMode = flags[0] == 2
 		reedsolo = flags[3] == 1
 		padded = flags[4] == 1
+		if paranoid { cipherSelected = 2 } else if aesMode { cipherSelected = 1 } else { cipherSelected = 0 }
 		if deniability {
 			keyfile = flags[1] == 1
 			keyfileOrdered = flags[2] == 1
@@ -1970,11 +1991,19 @@ func work() {
 		}
 	}
 
-	done, counter := 0, 0
-	chacha, err := chacha20.NewUnauthenticatedCipher(key, nonce)
-	if err != nil {
-		panic(err)
-	}
+done, counter := 0, 0
+var chacha *chacha20.Cipher
+var aesStream cipher.Stream
+if aesMode {
+	// AES-256-CTR: use first 16 bytes of nonce as IV (derive from 24-byte nonce)
+	block, aerr := aes.NewCipher(key)
+	if aerr != nil { panic(aerr) }
+	iv := nonce[:16]
+	aesStream = cipher.NewCTR(block, iv)
+} else {
+	chacha, err = chacha20.NewUnauthenticatedCipher(key, nonce)
+	if err != nil { panic(err) }
+}
 
 	// Use HKDF-SHA3 to generate a subkey for the MAC
 	var mac hash.Hash
@@ -2047,7 +2076,11 @@ func work() {
 				copy(src, dst)
 			}
 
-			chacha.XORKeyStream(dst, src)
+			if aesMode {
+				aesStream.XORKeyStream(dst, src)
+			} else {
+				chacha.XORKeyStream(dst, src)
+			}
 			if _, err := mac.Write(dst); err != nil {
 				panic(err)
 			}
@@ -2139,10 +2172,8 @@ func work() {
 				dst = make([]byte, len(src))
 			}
 
-			if _, err := mac.Write(src); err != nil {
-				panic(err)
-			}
-			chacha.XORKeyStream(dst, src)
+			if _, err := mac.Write(src); err != nil { panic(err) }
+			if aesMode { aesStream.XORKeyStream(dst, src) } else { chacha.XORKeyStream(dst, src) }
 
 			if paranoid {
 				copy(src, dst)
@@ -2181,24 +2212,20 @@ func work() {
 
 		// Change nonce/IV after 60 GiB to prevent overflow
 		if counter >= 60*GiB {
-			// ChaCha20
+			// ChaCha20 or AES
 			nonce = make([]byte, 24)
-			if n, err := hkdf.Read(nonce); err != nil || n != 24 {
-				panic(errors.New("fatal hkdf.Read error"))
+			if n, err := hkdf.Read(nonce); err != nil || n != 24 { panic(errors.New("fatal hkdf.Read error")) }
+			if aesMode {
+				block, aerr := aes.NewCipher(key); if aerr != nil { panic(aerr) }
+				iv := nonce[:16]
+				aesStream = cipher.NewCTR(block, iv)
+			} else {
+				chacha, err = chacha20.NewUnauthenticatedCipher(key, nonce); if err != nil { panic(err) }
 			}
-			chacha, err = chacha20.NewUnauthenticatedCipher(key, nonce)
-			if err != nil {
-				panic(err)
-			}
-
 			// Serpent
 			serpentIV = make([]byte, 16)
-			if n, err := hkdf.Read(serpentIV); err != nil || n != 16 {
-				panic(errors.New("fatal hkdf.Read error"))
-			}
+			if n, err := hkdf.Read(serpentIV); err != nil || n != 16 { panic(errors.New("fatal hkdf.Read error")) }
 			serpent = cipher.NewCTR(s, serpentIV)
-
-			// Reset counter to 0
 			counter = 0
 		}
 	}
@@ -2666,6 +2693,10 @@ func resetUI() {
 	commentsDisabled = false
 
 	paranoid = false
+	aesMode = false
+	cipherSelected = 0
+	aesMode = false
+	cipherSelected = 0
 	reedsolo = false
 	deniability = false
 	recursively = false
