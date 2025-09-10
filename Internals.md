@@ -3,9 +3,9 @@ If you're wondering about how Picocrypt handles cryptography, you've come to the
 
 # Core Cryptography
 Picocrypt uses the following cryptographic primitives:
-- XChaCha20 (cascaded with Serpent in counter mode for paranoid mode)
+- XChaCha20 (default) or AES-256-CTR (optional); Paranoid mode cascades XChaCha20 with Serpent (CTR)
 - Keyed-BLAKE2b for normal mode, HMAC-SHA3 for paranoid mode (256-bit key, 512-bit digest)
-- HKDF-SHA3 for deriving a subkey for the MAC above, as well as a key for Serpent
+- HKDF-SHA3 for deriving a subkey for the MAC above, as well as a key/IV refresh material and Serpent key
 - Argon2id:
     - Normal mode: 4 passes, 1 GiB memory, 4 threads
     - Paranoid mode: 8 passes, 1 GiB memory, 8 threads
@@ -14,6 +14,8 @@ All primitives used are from the well-known [golang.org/x/crypto](https://pkg.go
 
 # Counter Overflow
 Since XChaCha20 has a max message size of 256 GiB, Picocrypt will use the HKDF-SHA3 mentioned above to generate a new nonce for XChaCha20 and a new IV for Serpent if the total encrypted data is more than 60 GiB. While this threshold can be increased up to 256 GiB, Picocrypt uses 60 GiB to prevent any edge cases with blocks or the counter used by Serpent.
+
+When AES-256-CTR is selected, Picocrypt similarly re-keys after every ~60 GiB by deriving a fresh 24-byte nonce via HKDF and using its first 16 bytes as the AES CTR IV. Serpent IV is also refreshed on the same cadence when Paranoid mode is enabled.
 
 # Header Format
 A Picocrypt volume's header is encoded with Reed-Solomon by default since it is, after all, the most important part of the entire file. An encoded value will take up three times the size of the unencoded value.
@@ -24,7 +26,7 @@ A Picocrypt volume's header is encoded with Reed-Solomon by default since it is,
 | 0      | 15           | 5            | Version number (ex. "v1.15")
 | 15     | 15           | 5            | Length of comments, zero-padded to 5 bytes
 | 30     | 3C           | C            | Comments with a length of C characters
-| 30+3C  | 15           | 5            | Flags (paranoid mode, use keyfiles, etc.)
+| 30+3C  | 15           | 5            | Flags (cipher/mode, keyfiles, RS, internals)
 | 45+3C  | 48           | 16           | Salt for Argon2
 | 93+3C  | 96           | 32           | Salt for HKDF-SHA3
 | 189+3C | 48           | 16           | IV for Serpent
@@ -49,10 +51,21 @@ If Reed-Solomon is to be used with the input data itself, the data will be encod
 To address the edge case where the final 128-byte block happens to be padded so that it completes a full 1 MiB chunk, a flag is used to distinguish whether the last 128-byte block was padded originally or if it is just a full 128-byte block of data.
 
 # Deniability
-Plausible deniability in Picocrypt is achieved by simply re-encrypting the volume but without storing any identifiable header data. A new Argon2 salt and XChaCha20 nonce will be generated and stored in the deniable volume, but since both values are random, they don't reveal anything. A deniable volume will look something like this:
+Plausible deniability in Picocrypt is achieved by simply re-encrypting the volume but without storing any identifiable header data. A new Argon2 salt and XChaCha20 nonce will be generated and stored in the deniable volume, but since both values are random, they don't reveal anything. (Deniability always uses XChaCha20 for the outer re-encryption.) A deniable volume will look something like this:
 ```
 [argon2 salt][xchacha20 nonce][encrypted stream of bytes]
 ```
+
+# Flags
+The 5 decoded flag bytes (after Reed-Solomon) at offset `30+3C` encode mode/options as follows:
+- flags[0]: cipher/mode selector
+    - 0 = Normal (XChaCha20)
+    - 1 = Paranoid (XChaCha20 + Serpent cascade, HMAC-SHA3, stronger Argon2)
+    - 2 = AES (AES-256-CTR)
+- flags[1]: 1 if keyfiles were used
+- flags[2]: 1 if keyfile ordering is required
+- flags[3]: 1 if Reed-Solomon was applied to data
+- flags[4]: internal padding marker for Reed-Solomon edge case
 
 # Just Read the Code
 Picocrypt is a very simple tool and only has one source file. The source Go file is just 2K lines and a lot of the code is dealing with the UI. The core cryptography code is only about 1K lines of code, and even so, a lot of that code deals with the UI and other features of Picocrypt. So if you need more information about how Picocrypt works, just read the code. It's not long, and it is well commented and will explain what happens under the hood better than a document can.

@@ -124,7 +124,7 @@ var splitUnits = []string{"KiB", "MiB", "GiB", "TiB", "Total"}
 var splitSelected int32 = 1
 var recombine bool
 var compress bool
-var delete bool
+var delete bool = true
 var autoUnzip bool
 var sameLevel bool
 var keep bool
@@ -2705,7 +2705,7 @@ func resetUI() {
 	splitSelected = 1
 	recombine = false
 	compress = false
-	delete = false
+	delete = true
 	autoUnzip = false
 	sameLevel = false
 	keep = false
