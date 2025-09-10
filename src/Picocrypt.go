@@ -14,6 +14,7 @@ https://github.com/Picocrypt/Picocrypt
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/json"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -29,8 +30,10 @@ import (
 	"math"
 	"math/big"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -74,6 +77,8 @@ var showPassgen bool
 var showKeyfile bool
 var showOverwrite bool
 var showProgress bool
+var showDeleteConfirm bool
+var showDone bool
 
 // Input and output files
 var inputFile string
@@ -136,6 +141,10 @@ var mainStatus = "Ready"
 var mainStatusColor = WHITE
 var popupStatus string
 var requiredFreeSpace int64
+var dontAskDeleteAgain bool
+var skipDeleteConfirmOnce bool
+var donePath string
+var doneNote string
 
 // Progress variables
 var progress float32
@@ -217,6 +226,14 @@ func onClickStartButton() {
 	if keyfile && keyfiles == nil {
 		mainStatus = "Please select your keyfiles"
 		mainStatusColor = RED
+		giu.Update()
+		return
+	}
+
+	// Confirm deletion if enabled by default and not suppressed
+	if delete && !dontAskDeleteAgain && !skipDeleteConfirmOnce {
+		showDeleteConfirm = true
+		modalId++
 		giu.Update()
 		return
 	}
@@ -452,15 +469,95 @@ func draw() {
 				giu.OpenPopup("Progress:##" + strconv.Itoa(modalId))
 				giu.Update()
 			}
+
+			if showDone {
+				giu.PopupModal("Completed:##"+strconv.Itoa(modalId)).Flags(6).Layout(
+					giu.Label(func() string { if doneNote != "" { return doneNote } else { return "Operation completed successfully" } }()),
+					giu.Style().SetDisabled(true).To(
+						giu.InputText(&donePath).Size(giu.Auto),
+					),
+					giu.Row(
+						giu.Button("Open folder").OnClick(func() {
+							openInFileManager(donePath)
+						}),
+						giu.Button("Copy path").OnClick(func() {
+							giu.Context.GetPlatform().SetClipboard(donePath)
+						}),
+						giu.Button("Close").OnClick(func() {
+							giu.CloseCurrentPopup()
+							showDone = false
+						}),
+					),
+				).Build()
+				giu.OpenPopup("Completed:##" + strconv.Itoa(modalId))
+				giu.Update()
+			}
+
+			if showDeleteConfirm {
+				giu.PopupModal("Confirm deletion:##"+strconv.Itoa(modalId)).Flags(6).Layout(
+					giu.Label("'Delete files' aktif. Hapus file asli setelah proses selesai?"),
+					giu.Checkbox("Jangan tanya lagi", &dontAskDeleteAgain),
+					giu.Row(
+						giu.Button("Batal").Size(100, 0).OnClick(func() {
+							giu.CloseCurrentPopup()
+							showDeleteConfirm = false
+						}),
+						giu.Button("Lanjut").Size(100, 0).OnClick(func() {
+							giu.CloseCurrentPopup()
+							showDeleteConfirm = false
+							skipDeleteConfirmOnce = true
+							saveSettings()
+							onClickStartButton()
+						}),
+					),
+				).Build()
+				giu.OpenPopup("Confirm deletion:##" + strconv.Itoa(modalId))
+				giu.Update()
+			}
 		}),
 
 		giu.Row(
 			giu.Label(inputLabel),
+		),
+
+		// Second row: add/select buttons and right-aligned Clear
+		giu.Row(
+			giu.Style().SetDisabled(scanning).To(
+				giu.Button("Add file...").OnClick(func() {
+					f := dialog.File().Title("Choose a file to add")
+					f.SetStartDir(func() string {
+						if len(onlyFiles) > 0 { return filepath.Dir(onlyFiles[0]) }
+						if len(onlyFolders) > 0 { return filepath.Dir(onlyFolders[0]) }
+						return ""
+					}())
+					path, err := f.Load()
+					if err == nil && path != "" { onDrop([]string{path}) }
+				}),
+				giu.Tooltip("Pilih file dari dialog sistem"),
+			),
+			giu.Dummy(6, 0),
+			giu.Style().SetDisabled(scanning).To(
+				giu.Button("Add folder...").OnClick(func() {
+					d := dialog.Directory().Title("Choose a folder to add")
+					d.SetStartDir(func() string {
+						if len(onlyFolders) > 0 { return onlyFolders[0] }
+						if len(onlyFiles) > 0 { return filepath.Dir(onlyFiles[0]) }
+						return ""
+					}())
+					path, err := d.Browse()
+					if err == nil && path != "" { onDrop([]string{path}) }
+				}),
+				giu.Tooltip("Pilih folder dari dialog sistem"),
+			),
 			giu.Custom(func() {
+				w, _ := giu.GetAvailableRegion()
 				bw, _ := giu.CalcTextSize("Clear")
 				p, _ := giu.GetWindowPadding()
 				bw += p * 2
-				giu.Dummy((bw+p)/-dpi, 0).Build()
+				// push Clear to right edge
+				gap := (w/dpi) - (bw/dpi)
+				if gap < 0 { gap = 0 }
+				giu.Dummy(gap, 0).Build()
 				giu.SameLine()
 				giu.Style().SetDisabled((len(allFiles) == 0 && len(onlyFiles) == 0) || scanning).To(
 					giu.Button("Clear").Size(bw/dpi, 0).OnClick(resetUI),
@@ -2605,6 +2702,23 @@ if aesMode {
 		}
 	}
 
+	// Determine final path to show
+	finalPath := outputFile
+	if split {
+		finalPath = filepath.Dir(outputFile)
+	}
+	if mode == "decrypt" && autoUnzip {
+		if strings.HasSuffix(outputFile, ".zip") {
+			if sameLevel {
+				finalPath = filepath.Dir(outputFile)
+			} else {
+				finalPath = filepath.Join(filepath.Dir(outputFile), strings.TrimSuffix(filepath.Base(outputFile), ".zip"))
+			}
+		} else {
+			finalPath = filepath.Dir(outputFile)
+		}
+	}
+
 	// All done, reset the UI
 	oldKept := kept
 	resetUI()
@@ -2617,6 +2731,42 @@ if aesMode {
 	} else {
 		mainStatus = "Completed"
 		mainStatusColor = GREEN
+		// Show completion modal with output location
+		donePath = finalPath
+		doneNote = func() string {
+			if mode == "encrypt" && split {
+				return "Output split into chunks (see folder)."
+			}
+			if mode == "decrypt" && autoUnzip {
+				return "Decrypted and unzipped."
+			}
+			return ""
+		}()
+		showDone = true
+		modalId++
+		giu.Update()
+	}
+}
+
+// Open file manager at the location of given path
+func openInFileManager(path string) {
+	if path == "" { return }
+	dir := path
+	if stat, err := os.Stat(path); err == nil && !stat.IsDir() {
+		dir = filepath.Dir(path)
+	}
+	switch runtime.GOOS {
+	case "windows":
+		// explorer opens folder; use /select to highlight if file
+		if _, err := os.Stat(path); err == nil {
+			exec.Command("explorer", "/select,", path).Start()
+		} else {
+			exec.Command("explorer", dir).Start()
+		}
+	case "darwin":
+		exec.Command("open", dir).Start()
+	default:
+		exec.Command("xdg-open", dir).Start()
 	}
 }
 
@@ -2720,6 +2870,34 @@ func resetUI() {
 	progress = 0
 	progressInfo = ""
 	giu.Update()
+}
+
+// Settings persistence
+type appSettings struct {
+	DontAskDeleteAgain bool `json:"dontAskDeleteAgain"`
+}
+
+func settingsPath() string {
+	// Store next to binary as settings.json
+	exe, err := os.Executable()
+	if err != nil { return "settings.json" }
+	return filepath.Join(filepath.Dir(exe), "settings.json")
+}
+
+func loadSettings() {
+	data, err := os.ReadFile(settingsPath())
+	if err != nil { return }
+	var s appSettings
+	if json.Unmarshal(data, &s) == nil {
+		dontAskDeleteAgain = s.DontAskDeleteAgain
+	}
+}
+
+func saveSettings() {
+	s := appSettings{DontAskDeleteAgain: dontAskDeleteAgain}
+	b, err := json.MarshalIndent(s, "", "  ")
+	if err != nil { return }
+	_ = os.WriteFile(settingsPath(), b, 0600)
 }
 
 // Reed-Solomon encoder
@@ -2931,6 +3109,8 @@ func main() {
 	if rsErr1 != nil || rsErr2 != nil || rsErr3 != nil || rsErr4 != nil || rsErr5 != nil || rsErr6 != nil || rsErr7 != nil {
 		panic(errors.New("rs failed to init"))
 	}
+	// Load persisted settings (e.g., delete confirmation preference)
+	loadSettings()
 	// Create the main window
 	window = giu.NewMasterWindow("Picocrypt "+version[1:], 318, 507, giu.MasterWindowFlagsNotResizable)
 
